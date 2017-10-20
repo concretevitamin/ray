@@ -77,7 +77,8 @@ class Monitor(object):
             managers that were up at one point and have died since then.
     """
 
-    def __init__(self, redis_address, redis_port):
+    def __init__(self, redis_address, redis_port, _redis_flush_interval_secs,
+                 _redis_flush_idletime_secs):
         # Initialize the Redis clients.
         self.state = ray.experimental.state.GlobalState()
         self.state._initialize_global_state(redis_address, redis_port)
@@ -92,6 +93,9 @@ class Monitor(object):
         self.dead_local_schedulers = set()
         self.live_plasma_managers = Counter()
         self.dead_plasma_managers = set()
+
+        self._redis_flush_interval_secs = _redis_flush_interval_secs
+        self._redis_flush_idletime_secs = _redis_flush_idletime_secs
 
     def subscribe(self, channel):
         """Subscribe to the given channel.
@@ -497,6 +501,7 @@ class Monitor(object):
         while True:
             message = self.subscribe_client.get_message()
             if message is None:
+                # log.info('None msg')
                 return
 
             # Parse the message.
@@ -528,6 +533,37 @@ class Monitor(object):
             # Call the handler.
             assert (message_handler is not None)
             message_handler(channel, data)
+
+    def _flush_gcs_shard_unsafe(self, redis_shard_index,
+                                idletime_threshold_secs):
+        if idletime_threshold_secs < 0:
+            return
+        redis = self.state.redis_clients[redis_shard_index]
+        keys_to_flush = []
+
+        def Filter(match):
+            # Use a cursor in order not to block the redis shards.
+            for key in redis.scan_iter(match=match):
+                # The field used by Redis' approximate LRU algorithm.
+                idletime = redis.object(b'idletime', key)
+                if idletime >= idletime_threshold_secs:
+                    keys_to_flush.append(key)
+
+        # TODO(zongheng): what is the TT entry right after ray.init()?
+        Filter(TASK_TABLE_PREFIX + b"*")
+        Filter(OBJECT_INFO_PREFIX + b"*")
+        Filter(OBJECT_LOCATION_PREFIX + b"*")
+
+        num_deleted = 0
+        if keys_to_flush:
+            num_deleted = redis.delete(*keys_to_flush)
+            log.info("Flushed {} redis entries from redis shard {}: {}.".
+                     format(num_deleted, redis_shard_index, keys_to_flush))
+            if num_deleted != len(keys_to_flush):
+                log.warning("Failed to remove {} relevant redis entries"
+                            " from redis shard {}.".format(
+                                len(keys_to_flush) - num_deleted))
+        return num_deleted
 
     def run(self):
         """Run the monitor.
@@ -561,6 +597,7 @@ class Monitor(object):
                       len(self.dead_plasma_managers)))
 
         # Handle messages from the subscription channels.
+        last_flush_time = time.time()
         while True:
             # Record how many dead local schedulers and plasma managers we had
             # at the beginning of this round.
@@ -597,6 +634,24 @@ class Monitor(object):
             for plasma_manager_id in self.live_plasma_managers:
                 self.live_plasma_managers[plasma_manager_id] += 1
 
+            # EXPERIMENTAL: Flush to alleviate GCS memory pressure.
+            if self._redis_flush_interval_secs > 0 and \
+               self._redis_flush_idletime_secs >= 0:
+                t = time.time()
+                # log.info('curr time %.2f' % curr_time)
+                if t - last_flush_time > self._redis_flush_interval_secs:
+                    num_deleted = 0
+                    # TODO(zongheng): consider parallelizing this loop.
+                    for shard_index in range(len(self.state.redis_clients)):
+                        num_deleted += self._flush_gcs_shard_unsafe(
+                            shard_index, self._redis_flush_idletime_secs)
+                    last_flush_time = time.time()
+                    if num_deleted:
+                        log.info('GCS flushing took {:.2f} millisecs, '
+                                 'removed {} entries'.format(
+                                     (last_flush_time - t) * 1000,
+                                     num_deleted))
+
             # Wait for a heartbeat interval before processing the next round of
             # messages.
             time.sleep(HEARTBEAT_TIMEOUT_MILLISECONDS * 1e-3)
@@ -610,6 +665,19 @@ if __name__ == "__main__":
         required=True,
         type=str,
         help="the address to use for Redis")
+    parser.add_argument(
+        "--_redis_flush_interval_secs",
+        required=False,
+        type=int,
+        help="EXPERIMENTAL: Flush GCS entries in redis every this"
+        " many seconds.  USE AT OWN RISK.")
+    parser.add_argument(
+        "--_redis_flush_idletime_secs",
+        required=False,
+        type=int,
+        help="EXPERIMENTAL: Flush GCS entries in redis whose 'idletime'"
+        " is at least this many seconds.  USE AT OWN RISK.")
+
     args = parser.parse_args()
 
     redis_ip_address = get_ip_address(args.redis_address)
@@ -618,5 +686,11 @@ if __name__ == "__main__":
     # Initialize the global state.
     ray.global_state._initialize_global_state(redis_ip_address, redis_port)
 
-    monitor = Monitor(redis_ip_address, redis_port)
+    log.info(
+        '_redis_flush_interval_secs: %d' % args._redis_flush_interval_secs)
+    log.info(
+        '_redis_flush_idletime_secs: %d' % args._redis_flush_idletime_secs)
+    monitor = Monitor(redis_ip_address, redis_port,
+                      args._redis_flush_interval_secs,
+                      args._redis_flush_idletime_secs)
     monitor.run()
