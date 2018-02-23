@@ -22,7 +22,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
 add_executable(plasma_manager
   plasma_manager.cc)
 
-target_link_libraries(plasma_manager common ${PLASMA_STATIC_LIB} ray_static ${ARROW_STATIC_LIB} -lpthread)
+target_link_libraries(plasma_manager common ${PLASMA_SHARED_LIB} ray_static ${ARROW_STATIC_LIB} -lpthread)
 
 define_test(client_tests "")
 define_test(manager_tests "" plasma_manager.cc)

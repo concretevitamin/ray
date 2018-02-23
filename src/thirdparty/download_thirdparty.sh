@@ -8,9 +8,8 @@ set -e
 TP_DIR=$(cd "$(dirname "${BASH_SOURCE:-$0}")"; pwd)
 
 if [ ! -d $TP_DIR/arrow ]; then
-  git clone https://github.com/apache/arrow.git "$TP_DIR/arrow"
+  git clone https://github.com/concretevitamin/arrow.git "$TP_DIR/arrow"
 fi
 cd $TP_DIR/arrow
-git fetch origin master
-
-git checkout e26f3dad3675288564ef0c0330a5c9afcac652f1
+# git fetch origin crc32c
+git checkout  62700c0c8f4ab64fd36b060669e3953f518f7b06
